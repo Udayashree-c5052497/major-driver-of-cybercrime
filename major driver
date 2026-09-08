@@ -1,0 +1,2462 @@
+from google.colab import files
+
+uploaded = files.upload()
+# ============================================================
+# CYBERCRIME GLOBAL QUANTITATIVE ANALYSIS
+# GOOGLE COLAB - ROBUST VERSION
+# ============================================================
+
+!pip -q install pandas numpy requests openpyxl scipy statsmodels scikit-learn matplotlib
+
+import os
+import re
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+import matplotlib.pyplot as plt
+
+from scipy.stats import pearsonr, jarque_bera
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.stats.diagnostic import het_breuschpagan
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+from IPython.display import display, FileLink
+
+warnings.filterwarnings("ignore")
+
+print("Libraries loaded successfully.")
+
+
+# ============================================================
+# 1. FILE LOCATION
+# ============================================================
+
+BASE = Path("/content")
+
+UNODC_FILE = BASE / "data_cts_corruption_and_economic_crime.xlsx"
+
+print("\nUNODC file:")
+print(UNODC_FILE)
+
+print("File exists:", UNODC_FILE.exists())
+
+if not UNODC_FILE.exists():
+    raise FileNotFoundError(
+        "The UNODC Excel file is not in /content."
+    )
+
+
+# ============================================================
+# 2. INSPECT WORKBOOK
+# ============================================================
+
+print("\n" + "="*70)
+print("WORKBOOK INSPECTION")
+print("="*70)
+
+xls = pd.ExcelFile(UNODC_FILE)
+
+print("Sheets found:")
+
+for i, sheet in enumerate(xls.sheet_names):
+    print(i, ":", sheet)
+
+
+# ============================================================
+# 3. LOAD THE UNODC SHEET
+# ============================================================
+
+SHEET_NAME = xls.sheet_names[0]
+
+print("\nLoading sheet:")
+print(SHEET_NAME)
+
+# Read without assuming a header
+raw = pd.read_excel(
+    UNODC_FILE,
+    sheet_name=SHEET_NAME,
+    header=None
+)
+
+print("\nRaw dimensions:")
+print(raw.shape)
+
+
+# ============================================================
+# 4. FIND THE REAL HEADER ROW
+# ============================================================
+
+print("\n" + "="*70)
+print("SEARCHING FOR HEADER ROW")
+print("="*70)
+
+header_row = None
+
+# Search first 30 rows for the row containing
+# several expected UNODC fields.
+
+for i in range(min(30, len(raw))):
+
+    row_text = " | ".join(
+        raw.iloc[i]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .tolist()
+    )
+
+    score = 0
+
+    for term in [
+        "iso3",
+        "country",
+        "indicator",
+        "category",
+        "year",
+        "value",
+        "sex",
+        "age"
+    ]:
+
+        if term in row_text:
+            score += 1
+
+    if score >= 4:
+        header_row = i
+        break
+
+
+if header_row is None:
+
+    print("\nCould not automatically identify the header.")
+
+    print("\nFirst 15 rows of the workbook:")
+    display(raw.head(15))
+
+    raise ValueError(
+        "UNODC header row could not be identified. "
+        "The table above shows the actual workbook structure."
+    )
+
+
+print("Header row identified at Excel row:", header_row + 1)
+
+
+# ============================================================
+# 5. CREATE DATAFRAME USING HEADER
+# ============================================================
+
+headers = raw.iloc[header_row].tolist()
+
+df = raw.iloc[header_row + 1:].copy()
+
+df.columns = headers
+
+# Remove duplicate/empty column names
+clean_columns = []
+
+for i, col in enumerate(df.columns):
+
+    if pd.isna(col) or str(col).strip() == "":
+        clean_columns.append(f"Unnamed_{i}")
+    else:
+        clean_columns.append(str(col).strip())
+
+df.columns = clean_columns
+
+print("\nDetected columns:")
+
+for col in df.columns:
+    print("-", col)
+
+
+# ============================================================
+# 6. STANDARDISE COLUMN NAMES
+# ============================================================
+
+def normalise_column_name(column):
+
+    text = str(column).strip()
+
+    text = text.lower()
+
+    text = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        text
+    )
+
+    text = text.strip("_")
+
+    return text
+
+
+original_columns = list(df.columns)
+
+normalised_columns = [
+    normalise_column_name(c)
+    for c in df.columns
+]
+
+df.columns = normalised_columns
+
+print("\nNormalised columns:")
+
+for col in df.columns:
+    print("-", col)
+
+
+# ============================================================
+# 7. FIND IMPORTANT COLUMNS FLEXIBLY
+# ============================================================
+
+def find_column(columns, possible_names):
+
+    for candidate in possible_names:
+
+        candidate_norm = normalise_column_name(candidate)
+
+        for col in columns:
+
+            if col == candidate_norm:
+                return col
+
+    # Partial matching
+    for candidate in possible_names:
+
+        candidate_norm = normalise_column_name(candidate)
+
+        for col in columns:
+
+            if candidate_norm in col:
+                return col
+
+    return None
+
+
+iso_col = find_column(
+    df.columns,
+    [
+        "Iso3_code",
+        "ISO3",
+        "ISO3 code",
+        "Country ISO3"
+    ]
+)
+
+country_col = find_column(
+    df.columns,
+    [
+        "Country",
+        "Country name"
+    ]
+)
+
+indicator_col = find_column(
+    df.columns,
+    [
+        "Indicator"
+    ]
+)
+
+category_col = find_column(
+    df.columns,
+    [
+        "Category"
+    ]
+)
+
+sex_col = find_column(
+    df.columns,
+    [
+        "Sex"
+    ]
+)
+
+age_col = find_column(
+    df.columns,
+    [
+        "Age"
+    ]
+)
+
+year_col = find_column(
+    df.columns,
+    [
+        "Year"
+    ]
+)
+
+unit_col = find_column(
+    df.columns,
+    [
+        "Unit of measurement",
+        "Unit"
+    ]
+)
+
+value_col = find_column(
+    df.columns,
+    [
+        "VALUE",
+        "Value"
+    ]
+)
+
+
+print("\n" + "="*70)
+print("IDENTIFIED IMPORTANT COLUMNS")
+print("="*70)
+
+identified = {
+    "ISO3": iso_col,
+    "Country": country_col,
+    "Indicator": indicator_col,
+    "Category": category_col,
+    "Sex": sex_col,
+    "Age": age_col,
+    "Year": year_col,
+    "Unit": unit_col,
+    "Value": value_col
+}
+
+for name, col in identified.items():
+    print(f"{name:15} -> {col}")
+
+
+# ============================================================
+# 8. CHECK REQUIRED COLUMNS
+# ============================================================
+
+missing_columns = [
+    name
+    for name, col in identified.items()
+    if col is None
+]
+
+if missing_columns:
+
+    print("\nMissing columns:", missing_columns)
+
+    raise ValueError(
+        "Some required UNODC columns could not be identified."
+    )
+
+
+# ============================================================
+# 9. RENAME TO STANDARD NAMES
+# ============================================================
+
+df = df.rename(
+    columns={
+        iso_col: "Iso3_code",
+        country_col: "Country",
+        indicator_col: "Indicator",
+        category_col: "Category",
+        sex_col: "Sex",
+        age_col: "Age",
+        year_col: "Year",
+        unit_col: "Unit",
+        value_col: "VALUE"
+    }
+)
+
+
+# ============================================================
+# 10. CLEAN IMPORTANT VARIABLES
+# ============================================================
+
+for col in [
+    "Iso3_code",
+    "Country",
+    "Indicator",
+    "Category",
+    "Sex",
+    "Age",
+    "Unit"
+]:
+
+    df[col] = (
+        df[col]
+        .astype(str)
+        .str.strip()
+    )
+
+
+# ISO3
+df["Iso3_code"] = (
+    df["Iso3_code"]
+    .str.upper()
+    .str.strip()
+)
+
+
+# Year
+df["Year"] = pd.to_numeric(
+    df["Year"],
+    errors="coerce"
+)
+
+
+# Value
+df["VALUE"] = (
+    df["VALUE"]
+    .astype(str)
+    .str.replace(",", "", regex=False)
+    .str.strip()
+)
+
+df["VALUE"] = pd.to_numeric(
+    df["VALUE"],
+    errors="coerce"
+)
+
+
+# Remove invalid rows
+df = df[
+    df["Year"].notna()
+].copy()
+
+print("\nClean UNODC rows:", len(df))
+
+
+# ============================================================
+# 11. INSPECT CATEGORIES
+# ============================================================
+
+print("\n" + "="*70)
+print("CYBERCRIME CATEGORY INSPECTION")
+print("="*70)
+
+categories = (
+    df["Category"]
+    .dropna()
+    .astype(str)
+    .value_counts()
+)
+
+display(categories.head(30))
+
+
+# ============================================================
+# 12. DEFINE CYBERCRIME CATEGORIES
+# ============================================================
+
+cyber_categories = [
+    "Fraud: Cyber-related (Cy)",
+    "Unlawful access to a computer system",
+    "Unlawful interference with a computer system or computer data",
+    "Unlawful interception or access of computer data"
+]
+
+
+# ============================================================
+# 13. CHECK CATEGORY MATCHES
+# ============================================================
+
+print("\nChecking exact cybercrime category matches:")
+
+for category in cyber_categories:
+
+    matches = (
+        df["Category"]
+        .astype(str)
+        .str.strip()
+        .eq(category)
+        .sum()
+    )
+
+    print(f"{category}: {matches:,}")
+
+
+# ============================================================
+# 14. FILTER CYBERCRIME DATA
+# ============================================================
+
+cyber = df[
+    (
+        df["Category"]
+        .astype(str)
+        .str.strip()
+        .isin(cyber_categories)
+    )
+    &
+    (
+        df["Year"].between(2015, 2023)
+    )
+].copy()
+
+
+# ============================================================
+# 15. FIND RATE RECORDS
+# ============================================================
+
+print("\n" + "="*70)
+print("UNIT OF MEASUREMENT")
+print("="*70)
+
+display(
+    cyber["Unit"]
+    .value_counts()
+    .head(20)
+)
+
+
+# ============================================================
+# 16. FILTER RATE PER 100,000
+# ============================================================
+
+cyber = cyber[
+    cyber["Unit"]
+    .astype(str)
+    .str.lower()
+    .str.contains(
+        "rate per 100,000",
+        na=False
+    )
+].copy()
+
+
+# ============================================================
+# 17. FILTER TOTAL SEX AND AGE
+# ============================================================
+
+cyber = cyber[
+    cyber["Sex"]
+    .astype(str)
+    .str.lower()
+    .eq("total")
+].copy()
+
+cyber = cyber[
+    cyber["Age"]
+    .astype(str)
+    .str.lower()
+    .eq("total")
+].copy()
+
+
+# ============================================================
+# 18. REMOVE INVALID RATES
+# ============================================================
+
+cyber = cyber[
+    cyber["VALUE"].notna()
+].copy()
+
+cyber = cyber[
+    cyber["VALUE"] >= 0
+].copy()
+
+
+print("\n" + "="*70)
+print("FINAL UNODC CYBERCRIME DATA")
+print("="*70)
+
+print("Observations:", len(cyber))
+print("Countries:", cyber["Iso3_code"].nunique())
+print(
+    "Years:",
+    cyber["Year"].min(),
+    "to",
+    cyber["Year"].max()
+)
+
+
+# ============================================================
+# 19. CREATE LONG DATASET
+# ============================================================
+
+unodc_long = cyber[
+    [
+        "Iso3_code",
+        "Country",
+        "Category",
+        "Year",
+        "VALUE"
+    ]
+].copy()
+
+unodc_long = unodc_long.rename(
+    columns={
+        "VALUE": "crime_rate"
+    }
+)
+
+unodc_long = unodc_long.sort_values(
+    [
+        "Country",
+        "Year",
+        "Category"
+    ]
+)
+
+display(unodc_long.head(10))
+
+
+# ============================================================
+# 20. WIDE COUNTRY-YEAR DATASET
+# ============================================================
+
+unodc_wide = unodc_long.pivot_table(
+    index=[
+        "Iso3_code",
+        "Country",
+        "Year"
+    ],
+    columns="Category",
+    values="crime_rate",
+    aggfunc="mean"
+).reset_index()
+
+unodc_wide.columns.name = None
+
+
+# Rename categories
+unodc_wide = unodc_wide.rename(
+    columns={
+        "Fraud: Cyber-related (Cy)": "cyber_fraud_rate",
+
+        "Unlawful access to a computer system":
+            "unlawful_access_rate",
+
+        "Unlawful interference with a computer system or computer data":
+            "unlawful_interference_rate",
+
+        "Unlawful interception or access of computer data":
+            "unlawful_interception_rate"
+    }
+)
+
+
+print("\nCountry-year dataset:")
+display(unodc_wide.head())
+
+
+# ============================================================
+# 21. DESCRIPTIVE STATISTICS
+# ============================================================
+
+cyber_descriptives = (
+    unodc_long
+    .groupby("Category")["crime_rate"]
+    .agg(
+        observations="count",
+        countries="nunique",
+        mean="mean",
+        median="median",
+        std="std",
+        minimum="min",
+        maximum="max"
+    )
+    .reset_index()
+)
+
+print("\n" + "="*70)
+print("DESCRIPTIVE STATISTICS")
+print("="*70)
+
+display(cyber_descriptives)
+
+
+# ============================================================
+# 22. WORLD BANK API FUNCTION
+# ============================================================
+
+def download_world_bank_indicator(
+    indicator_code
+):
+
+    url = (
+        "https://api.worldbank.org/v2/country/all/"
+        f"indicator/{indicator_code}"
+        "?format=json&per_page=20000"
+    )
+
+    response = requests.get(
+        url,
+        timeout=60
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if len(data) < 2:
+
+        raise ValueError(
+            f"No World Bank data for {indicator_code}"
+        )
+
+    rows = []
+
+    for item in data[1]:
+
+        iso3 = item.get(
+            "countryiso3code"
+        )
+
+        year = item.get(
+            "date"
+        )
+
+        value = item.get(
+            "value"
+        )
+
+        if iso3 and year:
+
+            rows.append({
+                "Iso3_code": iso3.upper(),
+                "Year": int(year),
+                indicator_code: value
+            })
+
+    result = pd.DataFrame(rows)
+
+    result[indicator_code] = pd.to_numeric(
+        result[indicator_code],
+        errors="coerce"
+    )
+
+    return result
+
+
+# ============================================================
+# 23. WORLD BANK INDICATORS
+# ============================================================
+
+wb_indicators = {
+
+    "IT.NET.USER.ZS":
+        "internet_users_pct",
+
+    "IT.NET.BBND.P2":
+        "fixed_broadband_per_100",
+
+    "NY.GDP.PCAP.CD":
+        "gdp_per_capita",
+
+    "SL.UEM.TOTL.ZS":
+        "unemployment_rate",
+
+    "SI.POV.GINI":
+        "gini_index",
+
+    "SE.ADT.LITR.ZS":
+        "adult_literacy_rate"
+}
+
+
+# ============================================================
+# 24. DOWNLOAD WORLD BANK DATA
+# ============================================================
+
+print("\n" + "="*70)
+print("DOWNLOADING WORLD BANK DATA")
+print("="*70)
+
+world_bank = None
+
+for code, name in wb_indicators.items():
+
+    print(
+        f"Downloading {code}..."
+    )
+
+    temp = download_world_bank_indicator(
+        code
+    )
+
+    temp = temp.rename(
+        columns={
+            code: name
+        }
+    )
+
+    if world_bank is None:
+
+        world_bank = temp
+
+    else:
+
+        world_bank = world_bank.merge(
+            temp,
+            on=[
+                "Iso3_code",
+                "Year"
+            ],
+            how="outer"
+        )
+
+
+world_bank = world_bank[
+    world_bank["Year"].between(
+        2015,
+        2023
+    )
+].copy()
+
+print(
+    "\nWorld Bank rows:",
+    len(world_bank)
+)
+
+display(world_bank.head())
+
+
+# ============================================================
+# 25. MERGE UNODC AND WORLD BANK
+# ============================================================
+
+master = unodc_wide.merge(
+    world_bank,
+    on=[
+        "Iso3_code",
+        "Year"
+    ],
+    how="left"
+)
+
+print("\n" + "="*70)
+print("MASTER DATASET")
+print("="*70)
+
+print("Rows:", len(master))
+print(
+    "Countries:",
+    master["Iso3_code"].nunique()
+)
+
+display(master.head())
+
+
+# ============================================================
+# 26. MISSING DATA
+# ============================================================
+
+analysis_variables = [
+    "cyber_fraud_rate",
+    "unlawful_access_rate",
+    "unlawful_interference_rate",
+    "unlawful_interception_rate",
+    "internet_users_pct",
+    "fixed_broadband_per_100",
+    "gdp_per_capita",
+    "unemployment_rate",
+    "gini_index",
+    "adult_literacy_rate"
+]
+
+missing_summary = pd.DataFrame({
+
+    "variable":
+        analysis_variables,
+
+    "missing_count": [
+        master[v].isna().sum()
+        for v in analysis_variables
+    ],
+
+    "missing_percent": [
+        master[v].isna().mean() * 100
+        for v in analysis_variables
+    ]
+})
+
+print("\n" + "="*70)
+print("MISSING DATA ANALYSIS")
+print("="*70)
+
+display(missing_summary)
+
+
+# ============================================================
+# 27. PRINCIPAL ANALYSIS DATASET
+# ============================================================
+
+predictors = [
+    "internet_users_pct",
+    "fixed_broadband_per_100",
+    "gdp_per_capita",
+    "unemployment_rate",
+    "gini_index",
+    "adult_literacy_rate"
+]
+
+analysis_df = master[
+    [
+        "Iso3_code",
+        "Country",
+        "Year",
+        "cyber_fraud_rate"
+    ]
+    + predictors
+].copy()
+
+
+# ============================================================
+# 28. PEARSON CORRELATIONS
+# ============================================================
+
+print("\n" + "="*70)
+print("PEARSON CORRELATIONS")
+print("="*70)
+
+correlation_results = []
+
+for predictor in predictors:
+
+    temp = analysis_df[
+        [
+            "cyber_fraud_rate",
+            predictor
+        ]
+    ].dropna()
+
+    if len(temp) >= 3:
+
+        r, p = pearsonr(
+            temp["cyber_fraud_rate"],
+            temp[predictor]
+        )
+
+        correlation_results.append({
+
+            "variable": predictor,
+
+            "n": len(temp),
+
+            "pearson_r": r,
+
+            "p_value": p,
+
+            "significant_at_0.05":
+                p < 0.05
+        })
+
+
+correlations = pd.DataFrame(
+    correlation_results
+)
+
+display(correlations)
+
+
+# ============================================================
+# 29. 2023 CROSS-SECTION
+# ============================================================
+
+cross_2023 = analysis_df[
+    analysis_df["Year"] == 2023
+].copy()
+
+print("\n" + "="*70)
+print("2023 CROSS-SECTION")
+print("="*70)
+
+print(
+    "Country records:",
+    len(cross_2023)
+)
+
+
+# Complete regression cases
+regression_variables = [
+    "cyber_fraud_rate"
+] + predictors
+
+regression_2023 = cross_2023[
+    regression_variables
+].dropna().copy()
+
+print(
+    "Complete regression cases:",
+    len(regression_2023)
+)
+
+
+# ============================================================
+# 30. TRANSFORM SKEWED VARIABLES
+# ============================================================
+
+regression_2023[
+    "log_cyber_fraud_rate"
+] = np.log1p(
+    regression_2023[
+        "cyber_fraud_rate"
+    ]
+)
+
+regression_2023[
+    "log_gdp_per_capita"
+] = np.log1p(
+    regression_2023[
+        "gdp_per_capita"
+    ]
+)
+
+
+# ============================================================
+# 31. MULTIPLE LINEAR REGRESSION
+# ============================================================
+
+regression_predictors = [
+
+    "internet_users_pct",
+
+    "fixed_broadband_per_100",
+
+    "log_gdp_per_capita",
+
+    "unemployment_rate",
+
+    "gini_index",
+
+    "adult_literacy_rate"
+]
+
+X = regression_2023[
+    regression_predictors
+].copy()
+
+y = regression_2023[
+    "log_cyber_fraud_rate"
+].copy()
+
+X = sm.add_constant(X)
+
+ols_model = sm.OLS(
+    y,
+    X
+).fit()
+
+robust_model = ols_model.get_robustcov_results(
+    cov_type="HC3"
+)
+
+print("\n" + "="*70)
+print("MULTIPLE LINEAR REGRESSION")
+print("="*70)
+
+print(
+    robust_model.summary()
+)
+
+
+# ============================================================
+# 32. REGRESSION COEFFICIENT TABLE
+# ============================================================
+
+names = robust_model.model.exog_names
+
+conf = robust_model.conf_int()
+
+ols_coefficients = pd.DataFrame({
+
+    "variable":
+        names,
+
+    "coefficient":
+        robust_model.params,
+
+    "robust_std_error":
+        robust_model.bse,
+
+    "t_value":
+        robust_model.tvalues,
+
+    "p_value":
+        robust_model.pvalues,
+
+    "ci_lower":
+        conf[:, 0],
+
+    "ci_upper":
+        conf[:, 1]
+})
+
+display(ols_coefficients)
+
+
+# ============================================================
+# 33. MODEL STATISTICS
+# ============================================================
+
+model_statistics = pd.DataFrame({
+
+    "metric": [
+
+        "Observations",
+
+        "R_squared",
+
+        "Adjusted_R_squared",
+
+        "F_statistic",
+
+        "F_p_value",
+
+        "AIC",
+
+        "BIC"
+    ],
+
+    "value": [
+
+        int(ols_model.nobs),
+
+        ols_model.rsquared,
+
+        ols_model.rsquared_adj,
+
+        ols_model.fvalue,
+
+        ols_model.f_pvalue,
+
+        ols_model.aic,
+
+        ols_model.bic
+    ]
+})
+
+print("\nModel statistics:")
+
+display(model_statistics)
+
+
+# ============================================================
+# 34. VIF
+# ============================================================
+
+print("\n" + "="*70)
+print("MULTICOLLINEARITY - VIF")
+print("="*70)
+
+vif_data = regression_2023[
+    regression_predictors
+].dropna()
+
+vif_table = pd.DataFrame({
+
+    "variable":
+        vif_data.columns,
+
+    "VIF": [
+
+        variance_inflation_factor(
+            vif_data.values,
+            i
+        )
+
+        for i
+        in range(
+            vif_data.shape[1]
+        )
+    ]
+})
+
+display(vif_table)
+
+
+# ============================================================
+# 35. RESIDUAL DIAGNOSTICS
+# ============================================================
+
+residuals = ols_model.resid
+
+fitted = ols_model.fittedvalues
+
+
+# Jarque-Bera
+jb_stat, jb_p = jarque_bera(
+    residuals
+)
+
+
+# Breusch-Pagan
+bp = het_breuschpagan(
+    residuals,
+    ols_model.model.exog
+)
+
+
+diagnostics = pd.DataFrame({
+
+    "test": [
+
+        "Jarque-Bera",
+
+        "Breusch-Pagan LM",
+
+        "Breusch-Pagan F"
+    ],
+
+    "statistic": [
+
+        jb_stat,
+
+        bp[0],
+
+        bp[2]
+    ],
+
+    "p_value": [
+
+        jb_p,
+
+        bp[1],
+
+        bp[3]
+    ]
+})
+
+print("\n" + "="*70)
+print("REGRESSION DIAGNOSTICS")
+print("="*70)
+
+display(diagnostics)
+
+
+# ============================================================
+# 36. RESIDUAL PLOT
+# ============================================================
+
+plt.figure(
+    figsize=(8, 5)
+)
+
+plt.scatter(
+    fitted,
+    residuals
+)
+
+plt.axhline(
+    0,
+    linestyle="--"
+)
+
+plt.xlabel(
+    "Fitted values"
+)
+
+plt.ylabel(
+    "Residuals"
+)
+
+plt.title(
+    "Residuals vs Fitted Values"
+)
+
+plt.show()
+
+
+# ============================================================
+# 37. Q-Q PLOT
+# ============================================================
+
+sm.qqplot(
+    residuals,
+    line="45"
+)
+
+plt.title(
+    "Q-Q Plot of Regression Residuals"
+)
+
+plt.show()
+
+
+# ============================================================
+# 38. K-MEANS CLUSTER ANALYSIS
+# ============================================================
+
+print("\n" + "="*70)
+print("K-MEANS CLUSTER ANALYSIS")
+print("="*70)
+
+# Variables used for clustering
+cluster_variables = [
+    "cyber_fraud_rate",
+    "internet_users_pct",
+    "fixed_broadband_per_100",
+    "log_gdp_per_capita",
+    "unemployment_rate",
+    "gini_index",
+    "adult_literacy_rate"
+]
+
+# ------------------------------------------------------------
+# IMPORTANT:
+# log_gdp_per_capita was created in regression_2023.
+# Therefore, create it here in cross_2023 as well.
+# ------------------------------------------------------------
+
+cross_2023 = cross_2023.copy()
+
+cross_2023["log_gdp_per_capita"] = np.log1p(
+    cross_2023["gdp_per_capita"]
+)
+
+# Select clustering variables
+cluster_df = cross_2023[
+    [
+        "Iso3_code",
+        "Country"
+    ] + cluster_variables
+].dropna().copy()
+
+print(
+    "Countries available for clustering:",
+    len(cluster_df)
+)
+
+# ------------------------------------------------------------
+# Check whether enough countries are available
+# ------------------------------------------------------------
+
+if len(cluster_df) < 4:
+
+    print(
+        "\nNot enough complete country observations "
+        "for meaningful K-Means clustering."
+    )
+
+    cluster_df["cluster"] = np.nan
+
+    cluster_evaluation = pd.DataFrame()
+
+    cluster_profile = pd.DataFrame()
+
+else:
+
+    # --------------------------------------------------------
+    # Standardise clustering variables
+    # --------------------------------------------------------
+
+    scaler = StandardScaler()
+
+    X_cluster = scaler.fit_transform(
+        cluster_df[cluster_variables]
+    )
+
+    # --------------------------------------------------------
+    # Test different numbers of clusters
+    # --------------------------------------------------------
+
+    cluster_scores = []
+
+    max_k = min(
+        6,
+        len(cluster_df) - 1
+    )
+
+    for k in range(2, max_k + 1):
+
+        model = KMeans(
+            n_clusters=k,
+            random_state=42,
+            n_init=20
+        )
+
+        labels = model.fit_predict(
+            X_cluster
+        )
+
+        score = silhouette_score(
+            X_cluster,
+            labels
+        )
+
+        cluster_scores.append({
+
+            "k": k,
+
+            "silhouette_score":
+                score
+        })
+
+    cluster_evaluation = pd.DataFrame(
+        cluster_scores
+    )
+
+    print("\nSilhouette scores:")
+
+    display(
+        cluster_evaluation
+    )
+
+    # --------------------------------------------------------
+    # Select best number of clusters
+    # --------------------------------------------------------
+
+    best_k = int(
+        cluster_evaluation.loc[
+            cluster_evaluation[
+                "silhouette_score"
+            ].idxmax(),
+            "k"
+        ]
+    )
+
+    print(
+        "\nBest number of clusters:",
+        best_k
+    )
+
+    # --------------------------------------------------------
+    # Final K-Means model
+    # --------------------------------------------------------
+
+    kmeans = KMeans(
+        n_clusters=best_k,
+        random_state=42,
+        n_init=20
+    )
+
+    cluster_df["cluster"] = (
+        kmeans.fit_predict(
+            X_cluster
+        )
+    )
+
+    # --------------------------------------------------------
+    # Cluster profiles
+    # --------------------------------------------------------
+
+    cluster_profile = (
+        cluster_df
+        .groupby("cluster")[
+            cluster_variables
+        ]
+        .mean()
+        .reset_index()
+    )
+
+    cluster_counts = (
+        cluster_df
+        .groupby("cluster")
+        .size()
+        .reset_index(
+            name="country_count"
+        )
+    )
+
+    cluster_profile = cluster_profile.merge(
+        cluster_counts,
+        on="cluster"
+    )
+
+    print("\nCluster profiles:")
+
+    display(
+        cluster_profile
+    )
+
+    # --------------------------------------------------------
+    # Countries in each cluster
+    # --------------------------------------------------------
+
+    print("\nCountries by cluster:")
+
+    for cluster_number in sorted(
+        cluster_df["cluster"].unique()
+    ):
+
+        countries = cluster_df.loc[
+            cluster_df["cluster"] == cluster_number,
+            "Country"
+        ].tolist()
+
+        print(
+            f"\nCluster {cluster_number}: "
+            f"{len(countries)} countries"
+        )
+
+        print(
+            ", ".join(countries[:30])
+        )
+
+        if len(countries) > 30:
+            print(
+                f"... and {len(countries) - 30} more"
+            )
+
+print("\nK-Means clustering completed.")
+# ============================================================
+# FIX: IDENTIFY THE MASTER DATASET
+# ============================================================
+
+print("\nChecking available datasets...")
+
+# The earlier notebook created the merged dataset as `master`
+# If `master` exists, rename it to `master_df`.
+
+if "master" in globals():
+    master_df = master.copy()
+    print("Using dataset: master")
+
+elif "master_data" in globals():
+    master_df = master_data.copy()
+    print("Using dataset: master_data")
+
+elif "merged_data" in globals():
+    master_df = merged_data.copy()
+    print("Using dataset: merged_data")
+
+else:
+    raise NameError(
+        "Could not find the merged master dataset. "
+        "Please rerun the MASTER DATASET section."
+    )
+
+print("Master dataset loaded successfully.")
+print("Rows:", len(master_df))
+print("Countries:", master_df["Iso3_code"].nunique())
+print(
+    "Years:",
+    master_df["Year"].min(),
+    "to",
+    master_df["Year"].max()
+)
+
+print("\nColumns:")
+print(master_df.columns.tolist())
+# ============================================================
+# 39. CORRECTED REGRESSION ANALYSIS
+# ============================================================
+
+print("\n" + "="*70)
+print("CORRECTED REGRESSION ANALYSIS")
+print("="*70)
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.stats.diagnostic import het_breuschpagan
+from scipy.stats import jarque_bera
+
+# ------------------------------------------------------------
+# MAIN MODEL VARIABLES
+# ------------------------------------------------------------
+
+main_predictors = [
+    "internet_users_pct",
+    "fixed_broadband_per_100",
+    "gdp_per_capita",
+    "unemployment_rate"
+]
+
+outcome = "cyber_fraud_rate"
+
+# Work from the master dataset
+regression_data = master_df[
+    ["Iso3_code", "Country", "Year", outcome] + main_predictors
+].copy()
+
+# Remove rows missing variables required by main model
+regression_data = regression_data.dropna().copy()
+
+# Log-transform skewed variables
+regression_data["log_cyber_fraud_rate"] = np.log1p(
+    regression_data[outcome]
+)
+
+regression_data["log_gdp_per_capita"] = np.log1p(
+    regression_data["gdp_per_capita"]
+)
+
+print("\nComplete observations:", len(regression_data))
+print("Countries:", regression_data["Iso3_code"].nunique())
+print(
+    "Years:",
+    regression_data["Year"].min(),
+    "to",
+    regression_data["Year"].max()
+)
+
+# ------------------------------------------------------------
+# MODEL 1: LEVEL CYBERCRIME RATE
+# ------------------------------------------------------------
+
+X1 = regression_data[
+    [
+        "internet_users_pct",
+        "fixed_broadband_per_100",
+        "log_gdp_per_capita",
+        "unemployment_rate"
+    ]
+]
+
+X1 = sm.add_constant(X1)
+
+y1 = regression_data["log_cyber_fraud_rate"]
+
+model1 = sm.OLS(y1, X1).fit(cov_type="HC3")
+
+print("\n")
+print("="*70)
+print("MODEL 1: POOLED OLS")
+print("="*70)
+
+print(model1.summary())
+
+# ------------------------------------------------------------
+# COEFFICIENT TABLE
+# ------------------------------------------------------------
+
+coefficients = pd.DataFrame({
+    "variable": model1.params.index,
+    "coefficient": model1.params.values,
+    "robust_std_error": model1.bse.values,
+    "t_value": model1.tvalues.values,
+    "p_value": model1.pvalues.values,
+    "ci_lower": model1.conf_int()[0].values,
+    "ci_upper": model1.conf_int()[1].values
+})
+
+print("\nCoefficient table:")
+display(coefficients)
+
+# ------------------------------------------------------------
+# MODEL STATISTICS
+# ------------------------------------------------------------
+
+model_statistics = pd.DataFrame({
+    "metric": [
+        "Observations",
+        "R_squared",
+        "Adjusted_R_squared",
+        "F_statistic",
+        "F_p_value",
+        "AIC",
+        "BIC"
+    ],
+    "value": [
+        model1.nobs,
+        model1.rsquared,
+        model1.rsquared_adj,
+        model1.fvalue,
+        model1.f_pvalue,
+        model1.aic,
+        model1.bic
+    ]
+})
+
+print("\nModel statistics:")
+display(model_statistics)
+# ============================================================
+# 40. MULTICOLLINEARITY - VIF
+# ============================================================
+
+print("\n" + "="*70)
+print("MULTICOLLINEARITY - VIF")
+print("="*70)
+
+vif_data = regression_data[
+    [
+        "internet_users_pct",
+        "fixed_broadband_per_100",
+        "log_gdp_per_capita",
+        "unemployment_rate"
+    ]
+].copy()
+
+vif_matrix = pd.DataFrame()
+
+vif_matrix["variable"] = vif_data.columns
+
+vif_matrix["VIF"] = [
+    variance_inflation_factor(
+        vif_data.values,
+        i
+    )
+    for i in range(vif_data.shape[1])
+]
+
+display(vif_matrix)
+
+print("\nVIF interpretation:")
+for _, row in vif_matrix.iterrows():
+
+    variable = row["variable"]
+    vif = row["VIF"]
+
+    if vif < 5:
+        interpretation = "Low / acceptable multicollinearity"
+    elif vif < 10:
+        interpretation = "Moderate multicollinearity"
+    else:
+        interpretation = "High multicollinearity"
+
+    print(
+        f"{variable}: VIF = {vif:.2f} → {interpretation}"
+    )
+    # ============================================================
+# 41. REGRESSION DIAGNOSTICS
+# ============================================================
+
+print("\n" + "="*70)
+print("REGRESSION DIAGNOSTICS")
+print("="*70)
+
+residuals = model1.resid
+fitted = model1.fittedvalues
+
+# Jarque-Bera normality test
+jb_result = jarque_bera(residuals)
+
+# Breusch-Pagan heteroscedasticity test
+bp_result = het_breuschpagan(
+    residuals,
+    model1.model.exog
+)
+
+diagnostics = pd.DataFrame({
+    "test": [
+        "Jarque-Bera",
+        "Breusch-Pagan LM",
+        "Breusch-Pagan F"
+    ],
+    "statistic": [
+        jb_result.statistic,
+        bp_result[0],
+        bp_result[2]
+    ],
+    "p_value": [
+        jb_result.pvalue,
+        bp_result[1],
+        bp_result[3]
+    ]
+})
+
+display(diagnostics)
+
+print("\nDiagnostic interpretation:")
+
+for _, row in diagnostics.iterrows():
+
+    if row["p_value"] >= 0.05:
+        interpretation = (
+            "No statistically significant evidence "
+            "against the null assumption"
+        )
+    else:
+        interpretation = (
+            "Statistically significant evidence "
+            "against the null assumption"
+        )
+
+    print(
+        f"{row['test']}: p = {row['p_value']:.4f} → "
+        f"{interpretation}"
+    )
+    # ============================================================
+# 42. RESIDUAL DIAGNOSTIC PLOTS
+# ============================================================
+
+import matplotlib.pyplot as plt
+import scipy.stats as stats
+
+# Residuals vs fitted
+plt.figure(figsize=(8, 5))
+
+plt.scatter(
+    fitted,
+    residuals,
+    alpha=0.7
+)
+
+plt.axhline(
+    0,
+    linestyle="--"
+)
+
+plt.xlabel("Fitted values")
+plt.ylabel("Residuals")
+plt.title("Residuals vs Fitted Values")
+
+plt.show()
+
+
+# Q-Q plot
+plt.figure(figsize=(8, 5))
+
+stats.probplot(
+    residuals,
+    dist="norm",
+    plot=plt
+)
+
+plt.title("Q-Q Plot of Regression Residuals")
+
+plt.show()
+# ============================================================
+# 43. SUPPLEMENTARY SOCIOECONOMIC REGRESSION
+# ============================================================
+
+print("\n" + "="*70)
+print("SUPPLEMENTARY SOCIOECONOMIC REGRESSION")
+print("="*70)
+
+# ------------------------------------------------------------
+# Create the dataset FIRST
+# ------------------------------------------------------------
+
+supp_data = master_df[
+    [
+        "Iso3_code",
+        "Country",
+        "Year",
+        "cyber_fraud_rate",
+        "internet_users_pct",
+        "fixed_broadband_per_100",
+        "gdp_per_capita",
+        "unemployment_rate",
+        "gini_index"
+    ]
+].copy()
+
+# ------------------------------------------------------------
+# Create transformed variables AFTER selecting columns
+# ------------------------------------------------------------
+
+supp_data["log_cyber_fraud_rate"] = np.log1p(
+    supp_data["cyber_fraud_rate"]
+)
+
+supp_data["log_gdp_per_capita"] = np.log1p(
+    supp_data["gdp_per_capita"]
+)
+
+# ------------------------------------------------------------
+# Complete cases
+# ------------------------------------------------------------
+
+supp_data = supp_data.dropna().copy()
+
+print(
+    "\nComplete observations:",
+    len(supp_data)
+)
+
+print(
+    "Countries:",
+    supp_data["Iso3_code"].nunique()
+)
+
+print(
+    "Years:",
+    supp_data["Year"].min(),
+    "to",
+    supp_data["Year"].max()
+)
+
+# ------------------------------------------------------------
+# Run model only if enough observations exist
+# ------------------------------------------------------------
+
+supplementary_predictors = [
+    "internet_users_pct",
+    "fixed_broadband_per_100",
+    "log_gdp_per_capita",
+    "unemployment_rate",
+    "gini_index"
+]
+
+if len(supp_data) > len(supplementary_predictors) + 2:
+
+    X_supp = supp_data[
+        supplementary_predictors
+    ]
+
+    X_supp = sm.add_constant(X_supp)
+
+    y_supp = supp_data[
+        "log_cyber_fraud_rate"
+    ]
+
+    supplementary_model = sm.OLS(
+        y_supp,
+        X_supp
+    ).fit(
+        cov_type="HC3"
+    )
+
+    print("\n")
+    print("="*70)
+    print("GINI SUPPLEMENTARY MODEL")
+    print("="*70)
+
+    print(
+        supplementary_model.summary()
+    )
+
+    supplementary_coefficients = pd.DataFrame({
+        "variable":
+            supplementary_model.params.index,
+        "coefficient":
+            supplementary_model.params.values,
+        "robust_std_error":
+            supplementary_model.bse.values,
+        "t_value":
+            supplementary_model.tvalues.values,
+        "p_value":
+            supplementary_model.pvalues.values,
+        "ci_lower":
+            supplementary_model.conf_int()[0].values,
+        "ci_upper":
+            supplementary_model.conf_int()[1].values
+    })
+
+    print("\nCoefficient table:")
+    display(
+        supplementary_coefficients
+    )
+
+else:
+
+    supplementary_model = None
+    supplementary_coefficients = pd.DataFrame()
+
+    print(
+        "\nNot enough complete observations "
+        "for a reliable Gini regression."
+    )
+   # ============================================================
+# 43. SUPPLEMENTARY SOCIOECONOMIC REGRESSION
+# ============================================================
+
+print("\n" + "="*70)
+print("SUPPLEMENTARY SOCIOECONOMIC REGRESSION")
+print("="*70)
+
+# ------------------------------------------------------------
+# Create the dataset FIRST
+# ------------------------------------------------------------
+
+supp_data = master_df[
+    [
+        "Iso3_code",
+        "Country",
+        "Year",
+        "cyber_fraud_rate",
+        "internet_users_pct",
+        "fixed_broadband_per_100",
+        "gdp_per_capita",
+        "unemployment_rate",
+        "gini_index"
+    ]
+].copy()
+
+# ------------------------------------------------------------
+# Create transformed variables AFTER selecting columns
+# ------------------------------------------------------------
+
+supp_data["log_cyber_fraud_rate"] = np.log1p(
+    supp_data["cyber_fraud_rate"]
+)
+
+supp_data["log_gdp_per_capita"] = np.log1p(
+    supp_data["gdp_per_capita"]
+)
+
+# ------------------------------------------------------------
+# Complete cases
+# ------------------------------------------------------------
+
+supp_data = supp_data.dropna().copy()
+
+print(
+    "\nComplete observations:",
+    len(supp_data)
+)
+
+print(
+    "Countries:",
+    supp_data["Iso3_code"].nunique()
+)
+
+print(
+    "Years:",
+    supp_data["Year"].min(),
+    "to",
+    supp_data["Year"].max()
+)
+
+# ------------------------------------------------------------
+# Run model only if enough observations exist
+# ------------------------------------------------------------
+
+supplementary_predictors = [
+    "internet_users_pct",
+    "fixed_broadband_per_100",
+    "log_gdp_per_capita",
+    "unemployment_rate",
+    "gini_index"
+]
+
+if len(supp_data) > len(supplementary_predictors) + 2:
+
+    X_supp = supp_data[
+        supplementary_predictors
+    ]
+
+    X_supp = sm.add_constant(X_supp)
+
+    y_supp = supp_data[
+        "log_cyber_fraud_rate"
+    ]
+
+    supplementary_model = sm.OLS(
+        y_supp,
+        X_supp
+    ).fit(
+        cov_type="HC3"
+    )
+
+    print("\n")
+    print("="*70)
+    print("GINI SUPPLEMENTARY MODEL")
+    print("="*70)
+
+    print(
+        supplementary_model.summary()
+    )
+
+    supplementary_coefficients = pd.DataFrame({
+        "variable":
+            supplementary_model.params.index,
+        "coefficient":
+            supplementary_model.params.values,
+        "robust_std_error":
+            supplementary_model.bse.values,
+        "t_value":
+            supplementary_model.tvalues.values,
+        "p_value":
+            supplementary_model.pvalues.values,
+        "ci_lower":
+            supplementary_model.conf_int()[0].values,
+        "ci_upper":
+            supplementary_model.conf_int()[1].values
+    })
+
+    print("\nCoefficient table:")
+    display(
+        supplementary_coefficients
+    )
+
+else:
+
+    supplementary_model = None
+    supplementary_coefficients = pd.DataFrame()
+
+    print(
+        "\nNot enough complete observations "
+        "for a reliable Gini regression."
+    )
+    # ============================================================
+# 45. CORRECTED K-MEANS CLUSTERING
+# ============================================================
+
+print("\n" + "="*70)
+print("CORRECTED K-MEANS CLUSTERING")
+print("="*70)
+
+cluster_variables = [
+    "cyber_fraud_rate",
+    "internet_users_pct",
+    "fixed_broadband_per_100",
+    "gdp_per_capita",
+    "unemployment_rate"
+]
+
+cluster_df = master_df[
+    [
+        "Iso3_code",
+        "Country",
+        "Year"
+    ] + cluster_variables
+].copy()
+
+# Use 2023 where available
+cluster_2023 = cluster_df[
+    cluster_df["Year"] == 2023
+].copy()
+
+cluster_2023 = cluster_2023.dropna().copy()
+
+# Log-transform GDP
+cluster_2023["log_gdp_per_capita"] = np.log1p(
+    cluster_2023["gdp_per_capita"]
+)
+
+cluster_variables_final = [
+    "cyber_fraud_rate",
+    "internet_users_pct",
+    "fixed_broadband_per_100",
+    "log_gdp_per_capita",
+    "unemployment_rate"
+]
+
+cluster_2023 = cluster_2023[
+    [
+        "Iso3_code",
+        "Country"
+    ] + cluster_variables_final
+].dropna()
+
+print(
+    "Complete countries available:",
+    len(cluster_2023)
+)
+
+if len(cluster_2023) >= 6:
+
+    scaler = StandardScaler()
+
+    X_cluster = scaler.fit_transform(
+        cluster_2023[
+            cluster_variables_final
+        ]
+    )
+
+    # Test k = 2 to 6
+    cluster_scores = []
+
+    max_k = min(
+        6,
+        len(cluster_2023) - 1
+    )
+
+    for k in range(2, max_k + 1):
+
+        km = KMeans(
+            n_clusters=k,
+            random_state=42,
+            n_init=20
+        )
+
+        labels = km.fit_predict(
+            X_cluster
+        )
+
+        score = silhouette_score(
+            X_cluster,
+            labels
+        )
+
+        cluster_scores.append({
+            "k": k,
+            "silhouette_score": score
+        })
+
+    cluster_evaluation = pd.DataFrame(
+        cluster_scores
+    )
+
+    print("\nSilhouette scores:")
+    display(cluster_evaluation)
+
+    best_k = int(
+        cluster_evaluation.loc[
+            cluster_evaluation[
+                "silhouette_score"
+            ].idxmax(),
+            "k"
+        ]
+    )
+
+    print(
+        "\nSelected number of clusters:",
+        best_k
+    )
+
+    final_kmeans = KMeans(
+        n_clusters=best_k,
+        random_state=42,
+        n_init=20
+    )
+
+    cluster_2023["cluster"] = (
+        final_kmeans.fit_predict(
+            X_cluster
+        )
+    )
+
+    cluster_profile = (
+        cluster_2023
+        .groupby("cluster")[
+            cluster_variables_final
+        ]
+        .mean()
+        .reset_index()
+    )
+
+    cluster_counts = (
+        cluster_2023
+        .groupby("cluster")
+        .size()
+        .reset_index(
+            name="country_count"
+        )
+    )
+
+    cluster_profile = cluster_profile.merge(
+        cluster_counts,
+        on="cluster"
+    )
+
+    print("\nCluster profiles:")
+    display(cluster_profile)
+
+    print("\nCountries by cluster:")
+
+    for cluster_number in sorted(
+        cluster_2023["cluster"].unique()
+    ):
+
+        countries = cluster_2023.loc[
+            cluster_2023["cluster"] == cluster_number,
+            "Country"
+        ].tolist()
+
+        print(
+            f"\nCluster {cluster_number} "
+            f"({len(countries)} countries):"
+        )
+
+        print(
+            ", ".join(countries)
+        )
+
+else:
+
+    cluster_evaluation = pd.DataFrame()
+    cluster_profile = pd.DataFrame()
+
+    print(
+        "\nStill insufficient complete observations "
+        "for K-means."
+    )
+    # ============================================================
+# 46. DISSERTATION RESULTS SUMMARY
+# ============================================================
+
+print("\n" + "="*70)
+print("DISSERTATION RESULTS SUMMARY")
+print("="*70)
+
+results_summary = coefficients.copy()
+
+results_summary["significance"] = results_summary[
+    "p_value"
+].apply(
+    lambda p:
+        "***" if p < 0.001
+        else "**" if p < 0.01
+        else "*" if p < 0.05
+        else "ns"
+)
+
+display(results_summary)
+
+print("\nMain model:")
+print(
+    f"Observations = {int(model1.nobs)}"
+)
+
+print(
+    f"R² = {model1.rsquared:.4f}"
+)
+
+print(
+    f"Adjusted R² = {model1.rsquared_adj:.4f}"
+)
+
+print(
+    f"F-statistic = {model1.fvalue:.4f}"
+)
+
+print(
+    f"F-test p-value = {model1.f_pvalue:.4f}"
+)
+
+print(
+    "\nSignificance codes:"
+)
+
+print(
+    "*** p < 0.001"
+)
+
+print(
+    "** p < 0.01"
+)
+
+print(
+    "* p < 0.05"
+)
+
+print(
+    "ns = not statistically significant"
+)
+# ============================================================
+# 47. FINAL EXPORT — ERROR-SAFE VERSION
+# ============================================================
+
+print("\n" + "="*70)
+print("EXPORTING FINAL RESULTS")
+print("="*70)
+
+output_file = "/content/cybercrime_final_analysis.xlsx"
+
+# ------------------------------------------------------------
+# SAFELY CHECK OPTIONAL RESULTS
+# ------------------------------------------------------------
+
+if "supplementary_model" not in globals():
+    supplementary_model = None
+
+if "supplementary_coefficients" not in globals():
+    supplementary_coefficients = pd.DataFrame()
+
+if "literacy_model" not in globals():
+    literacy_model = None
+
+if "literacy_coefficients" not in globals():
+    literacy_coefficients = pd.DataFrame()
+
+if "cluster_evaluation" not in globals():
+    cluster_evaluation = pd.DataFrame()
+
+if "cluster_profile" not in globals():
+    cluster_profile = pd.DataFrame()
+
+if "cluster_2023" not in globals():
+    cluster_2023 = pd.DataFrame()
+
+# ------------------------------------------------------------
+# CREATE EXCEL WORKBOOK
+# ------------------------------------------------------------
+
+with pd.ExcelWriter(
+    output_file,
+    engine="openpyxl"
+) as writer:
+
+    # MAIN DATA
+    master_df.to_excel(
+        writer,
+        sheet_name="Master_Data",
+        index=False
+    )
+
+    # REGRESSION DATA
+    regression_data.to_excel(
+        writer,
+        sheet_name="Regression_Data",
+        index=False
+    )
+
+    # MAIN REGRESSION
+    coefficients.to_excel(
+        writer,
+        sheet_name="Regression_Coefficients",
+        index=False
+    )
+
+    model_statistics.to_excel(
+        writer,
+        sheet_name="Model_Statistics",
+        index=False
+    )
+
+    # VIF
+    vif_matrix.to_excel(
+        writer,
+        sheet_name="VIF",
+        index=False
+    )
+
+    # DIAGNOSTICS
+    diagnostics.to_excel(
+        writer,
+        sheet_name="Diagnostics",
+        index=False
+    )
+
+    # GINI MODEL
+    if (
+        supplementary_model is not None
+        and not supplementary_coefficients.empty
+    ):
+
+        supplementary_coefficients.to_excel(
+            writer,
+            sheet_name="Gini_Model",
+            index=False
+        )
+
+    # LITERACY MODEL
+    if (
+        literacy_model is not None
+        and not literacy_coefficients.empty
+    ):
+
+        literacy_coefficients.to_excel(
+            writer,
+            sheet_name="Literacy_Model",
+            index=False
+        )
+
+    # CLUSTER EVALUATION
+    if not cluster_evaluation.empty:
+
+        cluster_evaluation.to_excel(
+            writer,
+            sheet_name="Cluster_Evaluation",
+            index=False
+        )
+
+    # CLUSTER PROFILE
+    if not cluster_profile.empty:
+
+        cluster_profile.to_excel(
+            writer,
+            sheet_name="Cluster_Profile",
+            index=False
+        )
+
+    # CLUSTERS
+    if not cluster_2023.empty:
+
+        cluster_2023.to_excel(
+            writer,
+            sheet_name="Clusters",
+            index=False
+        )
+
+print("\n" + "="*70)
+print("EXPORT COMPLETED SUCCESSFULLY")
+print("="*70)
+
+print(
+    f"\nExcel file created:\n{output_file}"
+)
+
+# ------------------------------------------------------------
+# DOWNLOAD FROM COLAB
+# ------------------------------------------------------------
+
+from google.colab import files
+
+files.download(output_file)
